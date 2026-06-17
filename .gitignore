@@ -1,0 +1,25 @@
+# Environment variables
+.env
+
+# Python virtual environments
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Pyenv
+.python-version
+gmail-mcp-server
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+
+# Generated data
+*.log
+gmail-mcp-server/
+gmail-mcp-server/
