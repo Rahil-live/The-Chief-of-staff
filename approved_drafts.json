@@ -1,0 +1,20 @@
+[
+  {
+    "timestamp": "2026-06-14T20:50:54+05:30",
+    "source": "ai",
+    "thread_subject": "Q3 Roadmap Review - need your input by Friday",
+    "reply_to": "Elena Park",
+    "model": "gemini-2.5-flash",
+    "char_count": 245,
+    "draft": "Hi Elena,\n\nThanks for the heads-up on the Q3 review deck. I'll put together a concise update on the Onboarding rewrite, covering status, key risks, and what we need from leadership.\n\nI'll send it over by EOD Friday as you requested.\n\nBest,\nRahul"
+  },
+  {
+    "timestamp": "2026-06-14T20:53:53+05:30",
+    "source": "edited",
+    "thread_subject": "Dashboard keeps timing out",
+    "reply_to": "Marcus Lee",
+    "model": "gemini-2.5-flash",
+    "char_count": 209,
+    "draft": "Hi Marcus,\n\nReally sorry you're hitting this timeout issue, especially with an exec review coming up. I've flagged this with the engineering team, and they're looking into the this.\n\nThanks and Regards\nTanishq"
+  }
+]

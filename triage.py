@@ -1,11 +1,11 @@
 import os
-from google import genai
+import google.generativeai as genai
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 def triage_thread(sender: str, subject: str, snippet: str) -> dict:
     prompt = f"""
@@ -23,10 +23,7 @@ def triage_thread(sender: str, subject: str, snippet: str) -> dict:
         Reason: <one sentence explaining why>
         """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-    )
+    response = model.generate_content(prompt)
 
     return parse_triage_response(response.text)
 
@@ -43,7 +40,6 @@ def parse_triage_response(text: str) -> dict:
             result["reason"] = line.replace("Reason:", "").strip()
 
     return result
-
 
 def triage_inbox(threads: list) -> list:
     triaged = []
@@ -118,14 +114,17 @@ def format_digest(results: list) -> None:
             reason = r.get("reason", "")
             print(f"[{label}] {sender} | {subject} — {reason}")
 
-
 # Replace this with your actual Gmail thread fetch from Day 2
-sample_threads = [
-    {"sender": "boss@company.com", "subject": "Need your input by EOD", "snippet": "Can you review the attached proposal before 5pm?"},
-    {"sender": "newsletter@medium.com", "subject": "Top stories for you this week", "snippet": "Here's what's trending in tech..."},
-    {"sender": "recruiter@startup.io", "subject": "Quick call this week?", "snippet": "Hi, I came across your profile and wanted to connect..."},
-]
+# sample_threads = [
+#     {"sender": "boss@company.com", "subject": "Need your input by EOD", "snippet": "Can you review the attached proposal before 5pm?"},
+#     {"sender": "newsletter@medium.com", "subject": "Top stories for you this week", "snippet": "Here's what's trending in tech..."},
+#     {"sender": "recruiter@startup.io", "subject": "Quick call this week?", "snippet": "Hi, I came across your profile and wanted to connect..."},
+# ]
 
-results = triage_inbox(sample_threads)
+# results = triage_inbox(sample_threads)
 
-format_digest(results)
+# format_digest(results)
+
+
+
+

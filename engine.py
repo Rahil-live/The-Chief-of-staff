@@ -4,16 +4,33 @@ engine.py
 Chief-of-Staff email engine.
 
 Provides `fetch_threads()` which returns the most recent N inbox threads
-from Gmail via the configured Gmail MCP server.
+from Gmail in a normalized shape:
+    [
+        {
+            "thread_id": str,
+            "sender":    str,
+            "subject":   str,
+            "snippet":   str,
+            "date":      str,   # ISO-8601, e.g. "2026-06-13T12:34:56+00:00"
+        },
+        ...
+    ]
 
-Each thread is returned as a dict:
-    {
-        "thread_id": str,
-        "sender":     str,
-        "subject":    str,
-        "snippet":    str,
-        "date":       str,   # ISO-8601, e.g. "2026-06-13T12:34:56+00:00"
-    }
+Two execution paths are supported:
+
+1) MCP PATH (preferred, when run inside a Cline/Claude session):
+   - We document the exact MCP tool calls (`search_emails` ->
+     `read_email`) and emit a structured "mcp_plan" object describing
+     them. Cline (or any MCP-aware host) can execute the plan and feed
+     the raw thread payloads back into `materialize_threads()`.
+   - This path requires no Google credentials on disk.
+
+2) DIRECT PATH (when run as a standalone Python script):
+   - Uses the official `google-api-python-client` to hit the same
+     Gmail API endpoints the MCP server wraps. Same data, just
+     bypasses MCP.
+   - Requires `credentials.json` (OAuth desktop client) and a
+     `token.json` (auto-created on first run).
 """
 from __future__ import annotations
 import socket
@@ -32,458 +49,590 @@ def ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 
 socket.getaddrinfo = ipv4_only_getaddrinfo
 
-import json
 import os
-import subprocess
-import re
-import sys
 from datetime import datetime, timezone
 from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any
 
-# triage is imported lazily inside run_pipeline() to avoid import errors
-# when the google-generativeai library version is incompatible.
-
+from triage import triage_inbox, format_digest
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_MAX_RESULTS = 20
-GMAIL_USER_ID = "me"
+DEFAULT_MAX_RESULTS = 1
+GMAIL_USER_ID = "me"  # special "me" identifier for the authenticated user
 
 
 # ---------------------------------------------------------------------------
-# MCP JSON-RPC transport helpers
+# Header / metadata parsers
 # ---------------------------------------------------------------------------
 
-class McpClient:
-    """Minimal JSON-RPC client wrapping a Gmail MCP server subprocess."""
+def _extract_sender(headers: list[dict[str, str]]) -> str:
+    """Return the most useful From address from Gmail message headers."""
+    for h in headers:
+        if h.get("name", "").lower() == "from":
+            raw = h.get("value", "").strip()
+            if not raw:
+                return ""
+            # Prefer the bare email address when a display name is present.
+            _, addr = getaddresses([raw])[0]
+            if addr:
+                return addr.lower()
+            return raw
+    return ""
 
-    def __init__(self, server_path: str) -> None:
-        self.server_path = server_path
-        self._proc: subprocess.Popen | None = None
-        self._next_id = 1
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+def _extract_subject(headers: list[dict[str, str]]) -> str:
+    for h in headers:
+        if h.get("name", "").lower() == "subject":
+            return h.get("value", "").strip()
+    return ""
 
-    def __enter__(self) -> "McpClient":
-        self.start()
-        return self
 
-    def __exit__(self, *exc_info: Any) -> None:
-        self.stop()
-
-    def start(self) -> None:
-        """Spawn the MCP server process and perform the initialisation handshake."""
-        self._proc = subprocess.Popen(
-            ["node", self.server_path],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        # 1. Initialise
-        self._call(
-            "initialize",
-            {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "engine.py", "version": "1.0"},
-            },
-        )
-        # 2. Notify the server the client is initialised.
-        self._notify("notifications/initialized")
-
-    def stop(self) -> None:
-        if self._proc is not None:
+def _extract_date(headers: list[dict[str, str]]) -> str:
+    """Return the message date as an ISO-8601 string (UTC)."""
+    for h in headers:
+        if h.get("name", "").lower() == "date":
+            raw = h.get("value", "").strip()
+            if not raw:
+                break
             try:
-                self._proc.stdin.close()
-            except OSError:
-                pass
-            self._proc.terminate()
-            self._proc.wait(timeout=5)
-            self._proc = None
+                dt = parsedate_to_datetime(raw)
+                if dt is None:
+                    break
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                # Normalize to UTC ISO-8601 for stable downstream comparisons.
+                return dt.astimezone(timezone.utc).isoformat()
+            except (TypeError, ValueError):
+                break
+    # Fallback: "now" in ISO-8601. We prefer a real value, but never want to
+    # crash the pipeline over a missing header.
+    return datetime.now(timezone.utc).isoformat()
 
-    # ------------------------------------------------------------------
-    # Low-level RPC primitives
-    # ------------------------------------------------------------------
 
-    def _call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Send a JSON-RPC request and return the result portion of the response."""
-        req = {
-            "jsonrpc": "2.0",
-            "id": self._next_id,
-            "method": method,
+# ---------------------------------------------------------------------------
+# Normalization: raw message -> thread dict
+# ---------------------------------------------------------------------------
+
+def _normalize_message(message: dict[str, Any], thread_id: str) -> dict[str, str]:
+    """Convert a Gmail `users.messages.get` payload into our thread dict."""
+    payload = message.get("payload", {}) or {}
+    headers = payload.get("headers", []) or []
+
+    sender = _extract_sender(headers)
+    subject = _extract_subject(headers)
+    date = _extract_date(headers)
+    snippet = message.get("snippet", "") or ""
+
+    return {
+        "thread_id": thread_id or message.get("threadId", ""),
+        "sender": sender,
+        "subject": subject,
+        "snippet": snippet,
+        "date": date,
+    }
+
+
+# ---------------------------------------------------------------------------
+# MCP PLAN PATH
+# ---------------------------------------------------------------------------
+# When fetch_threads() is invoked from inside a Cline session, we can ask the
+# host to run the MCP tool calls on our behalf. The plan is a plain dict that
+# describes, step-by-step, the calls the host should make.
+
+
+def build_mcp_plan(max_results: int = DEFAULT_MAX_RESULTS) -> dict[str, Any]:
+    """
+    Return a dict describing the MCP tool calls required to fetch inbox
+    threads. A Cline/Claude host can execute these and then call
+    `materialize_threads()` with the results.
+
+    The plan shape is:
+        {
+            "tool": "gmail",
+            "steps": [
+                {"tool": "search_emails",
+                 "args": {"query": "in:inbox", "maxResults": 20}},
+                {"tool": "read_email",
+                 "args_for_each_message": True,
+                 "note": "Run once per messageId from step 1."},
+            ]
         }
-        if params is not None:
-            req["params"] = params
-        self._next_id += 1
-
-        assert self._proc is not None and self._proc.stdin is not None
-        self._proc.stdin.write(json.dumps(req) + "\n")
-        self._proc.stdin.flush()
-
-        # Read lines until we get a complete JSON object matching our id.
-        target_id = req["id"]
-        while True:
-            line = self._proc.stdout.readline()  # type: ignore[union-attr]
-            if not line:
-                raise ConnectionError("MCP server closed the connection prematurely.")
-            try:
-                resp = json.loads(line.strip())
-            except json.JSONDecodeError:
-                continue
-            if isinstance(resp, dict) and resp.get("id") == target_id:
-                if "error" in resp:
-                    raise RuntimeError(
-                        f"MCP error ({method}): {resp['error']}"
-                    )
-                return resp.get("result", {})
-
-    def _notify(self, method: str, params: dict[str, Any] | None = None) -> None:
-        """Send a JSON-RPC notification (no id / no response expected)."""
-        req = {"jsonrpc": "2.0", "method": method}
-        if params is not None:
-            req["params"] = params
-        assert self._proc is not None and self._proc.stdin is not None
-        self._proc.stdin.write(json.dumps(req) + "\n")
-        self._proc.stdin.flush()
-
-    # ------------------------------------------------------------------
-    # High-level MCP tool wrappers
-    # ------------------------------------------------------------------
-
-    def search_emails(
-        self, query: str, max_results: int = 20
-    ) -> list[dict[str, Any]]:
-        """Call the MCP 'search_emails' tool and return the messages list."""
-        result = self._call(
-            "tools/call",
+    """
+    return {
+        "tool": "gmail",
+        "steps": [
             {
-                "name": "search_emails",
-                "arguments": {
-                    "query": query,
+                "tool": "search_emails",
+                "args": {
+                    "query": "in:inbox",
                     "maxResults": max_results,
                 },
             },
-        )
-        raw = self._extract_text_content(result)
-        messages = self._parse_search_output(raw)
-        return messages
-
-    def read_email(self, message_id: str) -> dict[str, Any]:
-        """Call the MCP 'read_email' tool and return the full message object."""
-        result = self._call(
-            "tools/call",
             {
-                "name": "read_email",
-                "arguments": {"messageId": message_id},
+                "tool": "read_email",
+                "args_for_each_message": True,
+                "note": (
+                    "Call `read_email` once per messageId returned by "
+                    "step 1, then pass the full list of message objects to "
+                    "engine.materialize_threads()."
+                ),
             },
-        )
-        raw = self._extract_text_content(result)
-        return {"id": message_id, "raw_text": raw}
+        ],
+    }
 
-    # ------------------------------------------------------------------
-    # Response parsing helpers
-    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_text_content(result: dict[str, Any]) -> str:
-        """Pull the plain-text payload out of an MCP tool response."""
-        content = result.get("content", [])
-        for item in content:
-            if item.get("type") == "text":
-                return item.get("text", "")
-            resource = item.get("resource", {})
-            if resource.get("mimeType", "").startswith("text/"):
-                return resource.get("text", "")
-        return ""
+def materialize_threads(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """
+    Convert raw Gmail `users.messages.get` payloads (the kind `read_email`
+    returns) into our normalized thread-dict list.
 
-    @staticmethod
-    def _parse_search_output(raw: str) -> list[dict[str, Any]]:
-        """
-        Parse the text output of search_emails into a list of message stubs.
-
-        The readable output looks like::
-
-            ID: 19ed182032567688
-            Subject: 2 down — and Lesson 3 is where it gets fun!
-            From: Masai Live <hello@masaischool.com>
-            Date: Tue, 16 Jun 2026 17:36:58 +0000
-
-            ID: 19ed17f710709b3f
-            ...
-        """
-        messages: list[dict[str, Any]] = []
-        current: dict[str, Any] = {}
-
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line:
-                if current:
-                    messages.append(current)
-                    current = {}
-                continue
-            if line.startswith("ID: "):
-                current["id"] = line[len("ID: "):].strip()
-                current["threadId"] = current["id"]  # threads == messages here
-            elif line.startswith("Subject: "):
-                current["subject"] = line[len("Subject: "):].strip()
-            elif line.startswith("From: "):
-                current["from"] = line[len("From: "):].strip()
-            elif line.startswith("Date: "):
-                current["date"] = line[len("Date: "):].strip()
-
-        if current:
-            messages.append(current)
-
-        return messages
+    Use this when `fetch_threads()` is being driven by an MCP host: feed
+    in the messages you got from the `read_email` calls.
+    """
+    out: list[dict[str, str]] = []
+    for msg in messages:
+        thread_id = msg.get("threadId", "")
+        out.append(_normalize_message(msg, thread_id=thread_id))
+    return out
 
 
 # ---------------------------------------------------------------------------
-# MCP-based fetch_threads
+# DIRECT PATH  (google-api-python-client)
 # ---------------------------------------------------------------------------
+# This is what runs when you execute `python engine.py` directly. It uses
+# the same Google APIs the MCP server is built on, just without the MCP
+# transport layer.
 
-def _locate_mcp_server() -> str:
-    """Find the Gmail MCP server index.js relative to this file."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(script_dir, "gmail-mcp-server", "dist", "index.js"),
-        os.path.join(script_dir, "..", "gmail-mcp-server", "dist", "index.js"),
+def _build_gmail_service():
+    from google.auth.transport.requests import Request  # type: ignore
+    from google.oauth2.credentials import Credentials  # type: ignore
+    from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
+    from googleapiclient.discovery import build  # type: ignore
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    creds_path = os.path.join(here, "credentials.json")
+    token_path = os.path.join(here, "token.json")
+
+    print(f"[DEBUG] credentials path = {creds_path}")
+    print(f"[DEBUG] token path       = {token_path}")
+
+    scopes = [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/calendar",
     ]
-    for path in candidates:
-        norm = os.path.normpath(path)
-        if os.path.exists(norm):
-            return norm
-    # Try to find via symlink / alternate locations
-    raise FileNotFoundError(
-        "Could not locate gmail-mcp-server/dist/index.js. "
-        "Make sure the Gmail MCP server is installed."
+
+    creds: Credentials | None = None
+
+    if os.path.exists(token_path):
+        print("[DEBUG] token.json exists")
+        try:
+            creds = Credentials.from_authorized_user_file(token_path, scopes)
+            print("[DEBUG] loaded token.json")
+        except ValueError as e:
+            print(f"[DEBUG] token invalid: {e}")
+            creds = None
+
+    if not creds or not creds.valid:
+        print("[DEBUG] need authentication")
+
+        if creds and creds.expired and creds.refresh_token:
+            print("[DEBUG] refreshing token")
+            creds.refresh(Request())
+            print("[DEBUG] token refreshed")
+
+        else:
+            print("[DEBUG] starting OAuth flow")
+
+            if not os.path.exists(creds_path):
+                raise FileNotFoundError(
+                    f"Gmail OAuth client secrets not found at {creds_path}"
+                )
+
+            flow = InstalledAppFlow.from_client_secrets_file(
+                creds_path,
+                scopes,
+            )
+
+            creds = flow.run_local_server(
+                host="localhost",
+                port=8080,
+                open_browser=True,
+            )
+
+            print("[DEBUG] OAuth completed")
+
+        print("[DEBUG] writing token.json")
+
+        with open(token_path, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+
+        print("[DEBUG] token.json written")
+
+    print("[DEBUG] building Gmail service")
+
+    service = build(
+        "gmail",
+        "v1",
+        credentials=creds,
+        cache_discovery=False,
     )
 
+    print("[DEBUG] Gmail service built")
 
-def fetch_threads(max_results: int = DEFAULT_MAX_RESULTS) -> list[dict[str, str]]:
+    return service
+
+def _fetch_threads_direct(max_results: int) -> list[dict[str, str]]:
+    """Direct Gmail-API implementation of `fetch_threads`."""
+    service = _build_gmail_service()
+
+    # 1) Get the most recent inbox message IDs.
+    list_resp = (
+        service.users()
+        .messages()
+        .list(
+            userId=GMAIL_USER_ID,
+            q="in:inbox",
+            maxResults=max_results,
+        )
+        .execute()
+    )
+    message_refs = list_resp.get("messages", []) or []
+    if not message_refs:
+        return []
+
+    # 2) Hydrate each message with full metadata + snippet.
+    #    We request format=metadata to keep payloads small; snippet is
+    #    still included in the response.
+    normalized: list[dict[str, str]] = []
+    for ref in message_refs:
+        print(ref["id"])
+        msg = (
+            service.users()
+            .messages()
+            .get(
+                userId=GMAIL_USER_ID,
+                id=ref["id"],
+                format="metadata",
+                metadataHeaders=["From", "Subject", "Date"],
+            )
+            .execute()
+        )
+        normalized.append(
+            _normalize_message(
+                msg,
+                thread_id=ref.get("threadId", ""),
+            )
+        )
+
+    return normalized
+
+
+# ---------------------------------------------------------------------------
+# Full message fetch (on-demand, for meeting parsing)
+# ---------------------------------------------------------------------------
+
+def _extract_body(payload: dict) -> str:
+    """Recursively extract plain-text body from a Gmail message payload.
+
+    Gmail returns a tree of MIME parts. This walks the tree depth-first
+    and returns the first ``text/plain`` part it finds, base64url-decoded.
+    Falls back to the first ``text/html`` part (tags stripped) if no
+    plain-text part exists, and finally to an empty string.
     """
-    Fetch the most recent inbox threads from Gmail using the configured
-    Gmail MCP server.
+    import base64
+    import re as _re
+
+    mime_type = payload.get("mimeType", "")
+    parts = payload.get("parts") or []
+
+    # Leaf node with data
+    if not parts:
+        data = (payload.get("body") or {}).get("data", "")
+        if not data:
+            return ""
+        decoded = base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+        if mime_type == "text/plain":
+            return decoded
+        if mime_type == "text/html":
+            # Very light tag strip — good enough for Gemini context
+            return _re.sub(r"<[^>]+>", " ", decoded).strip()
+        return ""
+
+    # Multipart — prefer text/plain parts first
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+
+    for part in parts:
+        text = _extract_body(part)
+        if not text:
+            continue
+        if (part.get("mimeType") or "").startswith("text/plain"):
+            plain_parts.append(text)
+        else:
+            html_parts.append(text)
+
+    if plain_parts:
+        return "\n".join(plain_parts)
+    if html_parts:
+        return "\n".join(html_parts)
+    return ""
+
+
+def fetch_full_thread(thread_id: str) -> dict:
+    """Fetch all messages in a Gmail thread with their complete bodies.
+
+    Unlike ``_fetch_threads_direct`` (which uses ``format=metadata`` for
+    speed), this fetches ``format=full`` so the complete MIME payload is
+    available. It is intended to be called on demand — e.g. just before
+    parsing meeting details — rather than for every inbox thread.
+
+    Parameters
+    ----------
+    thread_id : str
+        Gmail thread ID (the ``id`` field stored in ``session_state``).
+
+    Returns
+    -------
+    dict
+        A UI-shape thread dict::
+
+            {
+                "id":       str,
+                "subject":  str,
+                "messages": [
+                    {"from": str, "date": str, "body": str},
+                    ...
+                ]
+            }
+
+        The ``body`` field contains the full decoded plain-text content of
+        each message, not the 100-char snippet.
+    """
+    service = _build_gmail_service()
+
+    thread_resp = (
+        service.users()
+        .threads()
+        .get(
+            userId=GMAIL_USER_ID,
+            id=thread_id,
+            format="full",
+        )
+        .execute()
+    )
+
+    raw_messages = thread_resp.get("messages") or []
+    subject = ""
+    messages_out: list[dict[str, str]] = []
+
+    for msg in raw_messages:
+        payload = msg.get("payload") or {}
+        headers = payload.get("headers") or []
+
+        sender = _extract_sender(headers)
+        date = _extract_date(headers)
+        msg_subject = _extract_subject(headers)
+
+        if msg_subject and not subject:
+            subject = msg_subject  # use subject from first message that has one
+
+        body = _extract_body(payload)
+
+        messages_out.append({
+            "from": sender,
+            "date": date,
+            "body": body,
+        })
+
+    return {
+        "id": thread_id,
+        "subject": subject,
+        "messages": messages_out,
+    }
+
+def send_reply(
+    thread_id: str,
+    to: str,
+    subject: str,
+    body: str,
+    message_id: str | None = None,
+) -> dict[str, str]:
+    """Send a reply to an existing Gmail thread.
+
+    Parameters
+    ----------
+    thread_id : str
+        The Gmail thread ID to attach the reply to.
+    to : str
+        Recipient address (e.g. "alice@example.com").
+    subject : str
+        Subject line. "Re: " is prepended automatically if not already present.
+    body : str
+        Plain-text email body.
+    message_id : str | None
+        The RFC-2822 Message-ID of the message being replied to.  When
+        provided, ``In-Reply-To`` and ``References`` headers are set so
+        Gmail (and most clients) thread the reply correctly.
+
+    Returns
+    -------
+    dict
+        ``{"message_id": str, "thread_id": str, "status": "sent"}``
+    """
+    import base64
+    from email.mime.text import MIMEText
+
+    # Ensure the subject carries the "Re: " prefix exactly once.
+    if not subject.lower().startswith("re:"):
+        subject = f"Re: {subject}"
+
+    # Build the MIME message.
+    mime_msg = MIMEText(body, "plain", "utf-8")
+    mime_msg["To"] = to
+    mime_msg["Subject"] = subject
+
+    if message_id:
+        # Strip surrounding angle brackets so we can normalise them.
+        clean_id = message_id.strip().strip("<>")
+        bracketed = f"<{clean_id}>"
+        mime_msg["In-Reply-To"] = bracketed
+        mime_msg["References"] = bracketed
+
+    # Gmail API expects the raw RFC-2822 message as a base64url-encoded string.
+    raw_bytes = mime_msg.as_bytes()
+    encoded = base64.urlsafe_b64encode(raw_bytes).decode("utf-8")
+
+    send_body: dict[str, str] = {
+        "raw": encoded,
+        "threadId": thread_id,
+    }
+
+    service = _build_gmail_service()
+    sent = (
+        service.users()
+        .messages()
+        .send(userId=GMAIL_USER_ID, body=send_body)
+        .execute()
+    )
+
+    return {
+        "message_id": sent.get("id", ""),
+        "thread_id": sent.get("threadId", thread_id),
+        "status": "sent",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def fetch_threads(
+    max_results: int = DEFAULT_MAX_RESULTS,
+    *,
+    use_mcp: bool | None = None,
+) -> list[dict[str, str]] | dict[str, Any]:
+    """
+    Fetch the most recent inbox threads from Gmail.
+
+    Returns either:
+      - a list of thread dicts (the common case), OR
+      - an MCP plan dict, if no Gmail credentials are available AND the
+        caller hasn't already gone through the MCP path. The plan tells
+        an MCP-aware host exactly which Gmail-MCP tools to invoke. Once
+        the host has executed the plan, it can pass the resulting
+        `read_email` payloads to `materialize_threads()` to get the
+        same list of dicts back.
 
     Parameters
     ----------
     max_results : int
         How many inbox threads to return. Defaults to 20.
-
-    Returns
-    -------
-    list[dict[str, str]]
-        Each dict has keys:
-            thread_id  — Gmail thread ID
-            sender     — sender email address
-            subject    — email subject line
-            snippet    — short text snippet
-            date       — ISO-8601 date string
+    use_mcp : bool | None
+        - True  : always emit an MCP plan, never hit Google directly.
+        - False : always hit Google directly, fail if creds missing.
+        - None  : try direct path; fall back to MCP plan if creds are
+                  not configured.
     """
-    mcp_path = _locate_mcp_server()
-    threads: list[dict[str, str]] = []
+    if use_mcp is True:
+        return build_mcp_plan(max_results=max_results)
 
-    with McpClient(mcp_path) as mcp:
-        # Step 1: search for inbox messages
-        messages = mcp.search_emails(query="in:inbox", max_results=max_results)
+    if use_mcp is False:
+        return _fetch_threads_direct(max_results=max_results)
 
-        # Step 2: read each message's full details
-        for msg in messages:
-            mid = msg.get("id", "")
-            if not mid:
-                continue
+    # Auto mode: try direct first, fall back to MCP plan on credential
+    # errors so the function never explodes during a Cline run.
+    here = os.path.dirname(os.path.abspath(__file__))
+    has_creds = os.path.exists(os.path.join(here, "credentials.json")) or os.path.exists(
+        os.path.join(here, "token.json")
+    )
+    if not has_creds:
+        return build_mcp_plan(max_results=max_results)
 
-            raw_response = mcp.read_email(mid)
-            raw_text = raw_response.get("raw_text", "")
-
-            # Parse the readable output into thread fields.
-            thread = _parse_readable_output(raw_text, thread_id=msg.get("threadId", mid))
-            if not thread["sender"]:
-                # Fallback: use data from the search result
-                thread["sender"] = _extract_email(msg.get("from", ""))
-            if not thread["subject"]:
-                thread["subject"] = msg.get("subject", "")
-            threads.append(thread)
-
-    return threads
-
-
-# ---------------------------------------------------------------------------
-# Readable-output parser
-# ---------------------------------------------------------------------------
-
-def _parse_readable_output(text: str, thread_id: str = "") -> dict[str, str]:
-    """
-    Parse the human-readable output of ``read_email`` into our thread dict.
-
-    Example input::
-
-        Thread ID: 19ed182032567688
-        Subject: 2 down — and Lesson 3 is where it gets fun!
-        From: Masai Live <hello@masaischool.com>
-        To: rahil8080@gmail.com
-        Date: Tue, 16 Jun 2026 17:36:58 +0000
-
-        [Note: This email is HTML-formatted. ...]
-        ...
-    """
-    result: dict[str, str] = {
-        "thread_id": thread_id,
-        "sender": "",
-        "subject": "",
-        "snippet": "",
-        "date": "",
-    }
-
-    lines = text.splitlines()
-    # Parse header block
-    for line in lines:
-        line_stripped = line.strip()
-        if not line_stripped:
-            # Blank line = end of headers
-            break
-        if line_stripped.startswith("Thread ID: "):
-            result["thread_id"] = line_stripped[len("Thread ID: "):].strip()
-        elif line_stripped.startswith("Subject: "):
-            result["subject"] = line_stripped[len("Subject: "):].strip()
-        elif line_stripped.startswith("From: "):
-            raw_from = line_stripped[len("From: "):].strip()
-            result["sender"] = _extract_email(raw_from)
-        elif line_stripped.startswith("Date: "):
-            raw_date = line_stripped[len("Date: "):].strip()
-            result["date"] = _normalize_date(raw_date)
-
-    # Build a snippet from the visible text after headers.
-    result["snippet"] = _build_snippet(text)
-
-    return result
-
-
-def _extract_email(raw: str) -> str:
-    """Pull out the bare email address from a 'Name <email>' string."""
-    if not raw:
-        return ""
-    _, addr = getaddresses([raw])[0]
-    return addr.lower() if addr else raw.strip().lower()
-
-
-def _normalize_date(raw: str) -> str:
-    """Convert a date string to ISO-8601 (UTC)."""
-    if not raw:
-        return datetime.now(timezone.utc).isoformat()
     try:
-        dt = parsedate_to_datetime(raw)
-        if dt is None:
-            return datetime.now(timezone.utc).isoformat()
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).isoformat()
-    except (TypeError, ValueError):
-        return datetime.now(timezone.utc).isoformat()
+        return _fetch_threads_direct(max_results=max_results)
+    except FileNotFoundError:
+        return build_mcp_plan(max_results=max_results)
+    except Exception:
+        import traceback
 
+        print("\n========== FULL TRACEBACK ==========\n")
+        traceback.print_exc()
+        print("\n====================================\n")
 
-def _html_unescape(text: str) -> str:
-    """Replace common HTML entities with their decoded characters."""
-    _amp = chr(38)  # &
-    _lt = chr(60)   # <
-    _gt = chr(62)   # >
-    _quot = chr(34) # "
-    _apos = chr(39) # '
-    _nbsp = chr(160) # non-breaking space
-
-    replacements = [
-        (_amp + "amp;", _amp),
-        (_amp + "lt;", _lt),
-        (_amp + "gt;", _gt),
-        (_amp + "quot;", _quot),
-        (_amp + "#39;", _apos),
-        (_amp + "#x27;", _apos),
-        (_amp + "#x60;", chr(96)),
-        (_amp + "nbsp;", _nbsp),
-        (_amp + "apos;", _apos),
-    ]
-    for entity, char in replacements:
-        text = text.replace(entity, char)
-    return text
-
-
-def _build_snippet(full_text: str, max_chars: int = 200) -> str:
-    """
-    Extract a short plain-text snippet from the email body.
-
-    Skips the header block, strips HTML tags, and removes tracking/note
-    prefixes.
-    """
-    lines = full_text.splitlines()
-    # Find the blank line that separates headers from body.
-    body_start = 0
-    for i, line in enumerate(lines):
-        if not line.strip():
-            body_start = i + 1
-            break
-
-    # Collect all body text, strip HTML, and collapse whitespace.
-    raw_parts: list[str] = []
-    for line in lines[body_start:]:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        # Skip "[Note:" lines (e.g. "HTML-formatted" notices)
-        if stripped.startswith("[Note:"):
-            continue
-        raw_parts.append(stripped)
-
-    body_text = " ".join(raw_parts)
-    # Strip all HTML tags
-    body_text = re.sub(r"<[^>]+>", "", body_text)
-    # Strip tracking-image placeholders like <img ... >
-    body_text = re.sub(r"<img[^>]*>", "", body_text, flags=re.IGNORECASE)
-    # Decode common HTML entities
-    body_text = _html_unescape(body_text)
-    # Collapse whitespace
-    body_text = re.sub(r"\s+", " ", body_text).strip()
-
-    if len(body_text) <= max_chars:
-        return body_text
-    return body_text[:max_chars].rsplit(" ", 1)[0] + " ..."
+        raise
 
 
 # ---------------------------------------------------------------------------
 # Pipeline: fetch -> triage
 # ---------------------------------------------------------------------------
 
-def run_pipeline(max_results: int = DEFAULT_MAX_RESULTS) -> list[dict[str, str]]:
+def run_pipeline(max_results: int = DEFAULT_MAX_RESULTS) -> None:
     """
-    Fetch ``max_results`` inbox threads from Gmail and classify each one
-    via ``triage_inbox()``. Returns the prioritized list of triaged threads.
+    Fetch `max_results` inbox threads from Gmail and classify each one
+    via `triage_inbox()`. Returns the prioritized list of triaged threads.
     """
-    # Lazy import to avoid dependency issues with google-generativeai
-    from triage import triage_inbox, format_digest
-
     threads = fetch_threads(max_results=max_results)
-    if not threads:
+    if not isinstance(threads, list):
+        # MCP-plan or error dict from auto mode -> nothing to triage.
         return []
-    return format_digest(triage_inbox(threads))
+    format_digest(triage_inbox(threads))
 
 
 # ---------------------------------------------------------------------------
 # CLI smoke test
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    import pprint
+# run_pipeline(1)
+# print(fetch_full_thread('19ef49f72c23eb9a'))
 
-    result = fetch_threads(20)
-    print(f"Fetched {len(result)} thread(s).\n")
-    for t in result:
-        print(
-            f"  {t['date']}  |  {t['sender']:<35}  |  {t['subject'][:55]}"
-        )
-    print()
-    pprint.pprint(result)
+# if __name__ == "__main__":
+#     import json
+
+#     result = fetch_threads()
+#     if isinstance(result, list):
+#         print(f"Fetched {len(result)} thread(s).")
+#         for t in result:
+#             print(
+#                 f"- {t['date']} | {t['sender']} | {t['subject'][:60]!r}"
+#             )
+#         print()
+
+#         # Classify each thread via triage.py
+#         results = triage_inbox(result)
+#         print(f"Triaged {len(results)} thread(s):")
+#         for r in results:
+#             print(
+#                 f"[{r['priority'].upper()}] [{r['category']}] "
+#                 f"{r['subject']} \u2014 {r['reason']}"
+#             )
+#         print()
+#         print("Full triaged payload:")
+#         print(json.dumps(results, indent=2))
+#     else:
+#         print("No Gmail credentials detected.")
+#         print("MCP plan to execute from a Cline/Claude session:")
+#         print(json.dumps(result, indent=2))

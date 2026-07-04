@@ -1,18 +1,48 @@
 {
-    "name": "Rahul",
-    "role": "Senior Product Manager",
-    "tone": "professional but warm",
-    "formality": "semi-formal — not stiff, not casual",
-    "sentence_length": "short to medium, gets to the point quickly",
-    "greeting_style": "\"Hi [Name],\" or just start talking if already in a thread",
-    "sign_off": "\"Best, Rahul\" or \"Thanks, R\" for quick replies",
-    "quirks": [
-        "Uses dashes — like this — for asides and emphasis",
-        "Asks one clear question per email, never buries multiple asks",
-        "Never uses 'I hope this email finds you well' or similar filler",
-        "Keeps replies under 5 sentences when possible",
-        "Uses numbered points for anything with more than 2 items",
-        "Acknowledges the other person's point before disagreeing",
-        "Ends with a clear next step or question"
-    ]
+  "name": "Rahil",
+  "role": "Software Developer",
+  "tone": "casual, practical, and direct",
+  "voice_description": "Rahil communicates like an engineer trying to solve a problem efficiently. He gets straight to the point, asks clarifying questions when needed, and prefers actionable answers over lengthy discussions. He uses simple language, real examples, terminal commands, and code snippets when useful. He is friendly but doesn't spend much time on formalities.",
+  "traits": [
+    "direct",
+    "practical",
+    "curious",
+    "problem-solver",
+    "informal",
+    "technical",
+    "efficient"
+  ],
+  "do": [
+    "Get to the solution quickly",
+    "Use examples and commands when explaining technical topics",
+    "Ask follow-up questions if information is missing",
+    "Keep explanations simple and step-by-step",
+    "Focus on what works in practice",
+    "Use short paragraphs"
+  ],
+  "dont": [
+    "Use corporate jargon",
+    "Write long introductions",
+    "Over-explain simple concepts",
+    "Add unnecessary formalities",
+    "Be vague about technical steps"
+  ],
+  "writing_patterns": [
+    "Why is this happening?",
+    "Can I do it this way instead?",
+    "Show step by step.",
+    "What's the better approach?",
+    "Give the command.",
+    "Explain with an example."
+  ],
+  "preferred_greetings": [
+    "Hi,",
+    "Hey,",
+    "Quick question,"
+  ],
+  "preferred_signoffs": [
+    "Thanks,",
+    "Cheers,"
+  ],
+  "signature": "Rahil"
 }

@@ -1,157 +1,299 @@
-# -*- coding: utf-8 -*-
 """
-Draft Machine — MS2.2: The Draft Machine
-Calls Gemini (gemini-2.5-flash) with assembled context to generate
-email replies that match your tone and follow the one-ask rule.
+draft_machine.py
+================
+
+Generates email replies using Google's Gemini model (``gemini-2.5-flash``)
+in the voice defined by ``tone_profile.json`` and the few-shot examples in
+``past_replies.json``.
+
+The module relies on ``context_builder.assemble_context`` to produce the
+system + user prompts, then layers on a strict set of "drafting rules"
+(ONE-ASK RULE, LENGTH CONTROL, NO AI FILLER, STRUCTURE) before calling
+Gemini.
+
+Public API
+----------
+- ``draft_reply(thread)``                  -> str
+- ``draft_reply_with_metadata(thread)``    -> dict
+- ``_missing_api_key_message()``           -> str (helper, exposed for tests)
 """
+
+from __future__ import annotations
 
 import os
-from google import genai
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
 from dotenv import load_dotenv
+
 from context_builder import assemble_context
 
-load_dotenv()
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-DRAFTING_RULES = """
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-CRITICAL DRAFTING RULES:
-1. ONE-ASK RULE: Every email must have exactly ONE clear question or ONE clear response.
-   Never bury multiple asks. If you need to address multiple points, make ONE the focus
-   and handle the rest as statements.
+MODEL_NAME = "gemini-2.5-flash"
 
-2. LENGTH CONTROL:
-   - Match the energy of the thread (short thread = short reply)
-   - Quick replies: 2-3 sentences max
-   - Substantive replies: 5 sentences max, use numbered points if needed
-   - NEVER write more than the sender wrote unless adding essential info
+# Extra drafting rules layered on top of the system prompt assembled by
+# ``context_builder``. These are the hard constraints every draft must obey.
+DRAFTING_RULES = """\
+Drafting rules (HARD CONSTRAINTS - obey all of these):
 
-3. NO AI FILLER:
-   - Never say "I hope this email finds you well"
-   - Never say "Thank you for reaching out"
-   - Never say "I wanted to follow up on"
-   - Never say "Please don't hesitate to"
-   - Never start with "I" — start with the content
+1. ONE-ASK RULE
+   Every reply contains exactly ONE clear question OR ONE clear request.
+   Never stack multiple asks ("could you do X, Y, and also Z?"). If the
+   incoming email has many open questions, pick the single most important
+   one and acknowledge the rest briefly.
 
-4. STRUCTURE:
-   - Acknowledge their point briefly (1 line max)
-   - Give your response/decision
-   - End with ONE clear next step or question
+2. LENGTH CONTROL
+   Match the energy of the incoming thread. Default to short: max 5
+   sentences total. Use a numbered list only if the reply genuinely needs
+   to enumerate distinct items (e.g. 3 concrete deliverables). Otherwise
+   write prose.
+
+3. NO AI FILLER
+   Never open with or include any of these phrases (or close variants):
+     - "I hope this finds you well"
+     - "I hope you're doing well"
+     - "Thank you for reaching out"
+     - "Thank you for your email"
+     - "Great question"
+     - "Certainly!"
+     - "I'd be happy to"
+   Just start with the substance.
+
+4. STRUCTURE
+   Order the reply exactly like this:
+     (a) one-line warm acknowledgment that references the specific message
+     (b) the response / substance
+     (c) ONE clear next step or question
+   No preamble. No sign-off explanation. Just the email body, ready to send.
 """
 
 
-def draft_reply(thread, tone_path="tone_profile.json", replies_path="past_replies.json"):
-    """
-    Generate a draft email reply for the given thread.
+# ---------------------------------------------------------------------------
+# Environment / API key handling
+# ---------------------------------------------------------------------------
 
-    Uses:
-    - Context builder (tone profile + past replies + thread history)
-    - Gemini 2.5 Flash model
-    - One-ask rule: every reply has exactly ONE clear question or response
-    - Length control: keep replies concise and match thread energy
+# Load .env from the same directory as this file (fallback to CWD).
+_HERE = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=_HERE / ".env")
+load_dotenv()  # also try CWD
 
-    Args:
-        thread: dict with 'subject' and 'messages' list
-        tone_path: path to tone_profile.json
-        replies_path: path to past_replies.json
 
-    Returns:
-        str: the drafted reply text
-    """
-    context = assemble_context(thread, tone_path, replies_path)
+def _get_api_key() -> str | None:
+    """Return the GEMINI_API_KEY from the environment, or None if missing."""
+    return os.getenv("GEMINI_API_KEY")
 
-    full_prompt = (
-        context["system"]
-        + "\n"
-        + DRAFTING_RULES
-        + "\n\n---\n\n"
-        + context["user"]
-        + "\n\nIMPORTANT: Output ONLY the email reply text. No subject line, no explanation, no markdown. Just the reply body as you would type it in Gmail."
+
+def _missing_api_key_message() -> str:
+    """Return the helpful error message shown when the API key is missing."""
+    return (
+        "GEMINI_API_KEY is not set.\n"
+        "Add it to a .env file in this directory, e.g.:\n"
+        "    GEMINI_API_KEY=your_real_key_here\n"
+        "or export it in your shell before running this script.\n"
+        "Get a key at: https://aistudio.google.com/apikey"
     )
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=full_prompt,
-    )
-    return response.text.strip()
 
+# ---------------------------------------------------------------------------
+# Gemini client
+# ---------------------------------------------------------------------------
 
-def draft_reply_with_metadata(thread, tone_path="tone_profile.json", replies_path="past_replies.json"):
+def _build_model():
+    """Construct a configured Gemini GenerativeModel.
+
+    Raises
+    ------
+    RuntimeError
+        If ``google.generativeai`` is not installed, or the API key is
+        missing.
     """
-    Like draft_reply() but returns metadata about the generation too.
-    Useful for debugging and the approval workflow (MS2.3).
+    try:
+        import google.generativeai as genai  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(
+            "The 'google-generativeai' package is not installed. "
+            "Install it with: pip install google-generativeai"
+        ) from e
+
+    api_key = _get_api_key()
+    if not api_key:
+        raise RuntimeError(_missing_api_key_message())
+
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        system_instruction=None,  # we'll pass system content via the prompt
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prompt assembly + post-processing
+# ---------------------------------------------------------------------------
+
+def _build_combined_prompts(thread: dict[str, Any]) -> tuple[str, str]:
+    """Return (system_prompt, user_prompt) with the drafting rules appended.
+
+    The drafting rules are appended to the system prompt (where they act
+    as hard constraints) and the user prompt is left untouched. The
+    combined system prompt is the "persona + few-shot + drafting rules"
+    stack.
     """
-    context = assemble_context(thread, tone_path, replies_path)
+    ctx = assemble_context(thread)
+    system_prompt = ctx["system"].rstrip() + "\n\n" + DRAFTING_RULES
+    user_prompt = ctx["user"]
+    return system_prompt, user_prompt
 
-    full_prompt = (
-        context["system"]
-        + "\n"
-        + DRAFTING_RULES
-        + "\n\n---\n\n"
-        + context["user"]
-        + "\n\nIMPORTANT: Output ONLY the email reply text. No subject line, no explanation, no markdown. Just the reply body as you would type it in Gmail."
+
+_FENCE_RE = re.compile(r"^```[a-zA-Z0-9]*\n|\n```$", re.MULTILINE)
+_SUBJECT_LINE_RE = re.compile(r"^\s*subject\s*:\s*.*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _post_process(raw: str) -> str:
+    """Clean up a model response into a send-ready draft.
+
+    - Strips wrapping Markdown code fences if the model added them.
+    - Removes a leading "Subject:" line if it slipped in.
+    - Trims surrounding whitespace.
+    """
+    text = raw.strip()
+
+    # Strip ``` blocks the model sometimes wraps replies in.
+    if text.startswith("```") and text.endswith("```"):
+        text = _FENCE_RE.sub("", text).strip()
+
+    # Drop a leading "Subject: ..." line if present.
+    text = _SUBJECT_LINE_RE.sub("", text, count=1).lstrip()
+
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def draft_reply(thread: dict[str, Any]) -> str:
+    """Generate a draft reply for ``thread`` and return only the body text.
+
+    Parameters
+    ----------
+    thread : dict
+        Thread dict with ``subject`` and ``messages`` (as expected by
+        ``context_builder.assemble_context``).
+
+    Returns
+    -------
+    str
+        The draft email body, ready to send (no subject, no preamble).
+    """
+    model = _build_model()
+    system_prompt, user_prompt = _build_combined_prompts(thread)
+
+    # Gemini's chat-style API: pass system as the first "user" turn with
+    # an explicit "system:" prefix is awkward; instead, prepend the system
+    # block to the user prompt with a clear delimiter. This works well in
+    # practice and keeps the call single-turn (lower latency, no state).
+    combined_user = (
+        f"[SYSTEM INSTRUCTIONS]\n{system_prompt}\n[/SYSTEM INSTRUCTIONS]\n\n"
+        f"{user_prompt}"
     )
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=full_prompt,
+    response = model.generate_content(
+        combined_user,
+        generation_config={
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 1024,
+        },
     )
-    draft = response.text.strip()
 
+    raw = response.text or ""
+    return _post_process(raw)
+
+
+def _extract_recipient_name(thread: dict[str, Any]) -> str:
+    """Best-effort: return the display name of the most recent sender."""
+    messages = thread.get("messages") or []
+    if not messages:
+        return "the sender"
+    last_from = messages[-1].get("from", "") or ""
+    # "Elena Park <elena@acme.com>" -> "Elena Park"
+    name_part = last_from.split("<", 1)[0].strip().strip('"')
+    if not name_part and "@" in last_from:
+        name_part = last_from.split("@", 1)[0]
+    return name_part or "the sender"
+
+
+def draft_reply_with_metadata(thread: dict[str, Any]) -> dict[str, Any]:
+    """Like ``draft_reply`` but also returns useful metadata.
+
+    Returns
+    -------
+    dict with keys:
+        - ``draft``          : str  - the email body
+        - ``model``          : str  - model name used
+        - ``thread_subject`` : str  - the original thread subject
+        - ``reply_to``       : str  - display name of the person being replied to
+        - ``char_count``     : int  - length of the draft in characters
+    """
+    draft = draft_reply(thread)
     return {
         "draft": draft,
-        "model": "gemini-2.5-flash",
-        "thread_subject": thread["subject"],
-        "reply_to": thread["messages"][-1]["from"],
+        "model": MODEL_NAME,
+        "thread_subject": thread.get("subject", ""),
+        "reply_to": _extract_recipient_name(thread),
+        "char_count": len(draft),
     }
 
 
-# ============================================================
-# Demo: Run on a sample thread
-# ============================================================
+# ---------------------------------------------------------------------------
+# Demo / CLI entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
+    # Same sample thread used by context_builder.py's demo, so the two
+    # modules are easy to compare end-to-end.
     sample_thread = {
-        "subject": "Q3 Budget Review",
+        "subject": "Q3 Roadmap Review - need your input by Friday",
         "messages": [
             {
-                "from": "boss@company.com",
-                "date": "June 10, 2:30 PM",
-                "body": "Can you review the Q3 budget doc and share your thoughts by EOD tomorrow? Specifically the marketing allocation — I think we're overspending on paid ads."
+                "from": "Elena Park <elena.park@acme.com>",
+                "date": "2026-06-12 10:42",
+                "body": (
+                    "Hi Rahul,\n\n"
+                    "Hope your week's going well. I'm putting together the Q3 review "
+                    "deck and would love a short paragraph from you on the Onboarding "
+                    "rewrite. Specifically: status, biggest risk, and what you need "
+                    "from leadership to land it.\n\n"
+                    "Could you send something by EOD Friday? Even 4-5 lines is fine.\n\n"
+                    "Thanks!\nElena"
+                ),
             },
-            {
-                "from": "you@company.com",
-                "date": "June 10, 3:15 PM",
-                "body": "Got it, will review tonight. Quick question — should I loop in the marketing team lead or keep it between us?"
-            },
-            {
-                "from": "boss@company.com",
-                "date": "June 11, 9:00 AM",
-                "body": "Keep it between us for now. Let me know what you find."
-            }
-        ]
+        ],
     }
 
-    print("=" * 60)
-    print("DRAFT MACHINE — MS2.2")
-    print("=" * 60)
-    print("\nThread: " + sample_thread["subject"])
-    print("Replying to: " + sample_thread["messages"][-1]["from"])
-    print("Their message: " + sample_thread["messages"][-1]["body"])
-    print("\n" + "-" * 60)
-    print("GENERATING DRAFT...")
-    print("-" * 60 + "\n")
+    if not _get_api_key():
+        print(_missing_api_key_message(), file=sys.stderr)
+        sys.exit(1)
 
-    if not os.environ.get("GEMINI_API_KEY"):
-        print("ERROR: GEMINI_API_KEY not set!")
-        print("Set it in your .env file or environment.")
-        exit(1)
+    try:
+        result = draft_reply_with_metadata(sample_thread)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
 
-    result = draft_reply_with_metadata(sample_thread)
-
-    print("DRAFT REPLY:")
-    print("=" * 60)
+    print("=" * 70)
+    print("GEMINI DRAFT")
+    print("=" * 70)
+    print(f"Model:           {result['model']}")
+    print(f"Thread subject:  {result['thread_subject']}")
+    print(f"Replying to:     {result['reply_to']}")
+    print(f"Char count:      {result['char_count']}")
+    print("-" * 70)
     print(result["draft"])
-    print("=" * 60)
-    print("\nModel: " + result["model"])
-    print("Replying to: " + result["reply_to"])
-    print("Subject: " + result["thread_subject"])
+    print("=" * 70)

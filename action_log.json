@@ -1,0 +1,23 @@
+[
+  {
+    "timestamp": "2026-06-30T12:00:47.576005+00:00",
+    "action_type": "sent",
+    "thread_subject": "Meeting for Discussion",
+    "detail": "ladpritish0@gmail.com",
+    "id": "19f1866880471740"
+  },
+  {
+    "timestamp": "2026-06-30T12:06:01.015940+00:00",
+    "action_type": "booked",
+    "thread_subject": "Meeting to discuss",
+    "detail": "Discuss new facts for gmail project",
+    "id": "dbr2k2qqe8a1jrq8la7flulo7o"
+  },
+  {
+    "timestamp": "2026-06-30T12:06:05.640605+00:00",
+    "action_type": "sent",
+    "thread_subject": "Meeting to discuss",
+    "detail": "rahil3030@gmail.com",
+    "id": "19f186b66d56613b"
+  }
+]

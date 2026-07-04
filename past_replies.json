@@ -1,17 +1,21 @@
 [
-    {
-        "subject": "Re: Design review feedback",
-        "to": "priya@company.com",
-        "body": "Hi Priya,\n\nReviewed the mockups — love the direction on the onboarding flow. Two things:\n\n1. The CTA on screen 3 feels buried. Can we make it more prominent?\n2. Font size on mobile looks tight. Worth testing on a real device.\n\nOtherwise good to go. Ship it.\n\nBest, Rahul"
-    },
-    {
-        "subject": "Re: Q3 planning timeline",
-        "to": "amit@company.com",
-        "body": "Amit,\n\nTimeline works for me. One ask — can we push the stakeholder review from Thursday to Friday? I've got a conflict that afternoon and don't want to send a delegate for this one.\n\nEverything else looks solid. Let's lock it in.\n\nThanks, R"
-    },
-    {
-        "subject": "Re: Vendor proposal - DataSync",
-        "to": "finance-team@company.com",
-        "body": "Hi team,\n\nLooked at the DataSync proposal. My take:\n\n1. Pricing is fair for what we get — comparable to what we paid for ToolX last year\n2. Integration timeline (3 weeks) is aggressive but doable if we start before July\n3. One concern — their SLA doesn't cover weekend incidents. Worth pushing on that.\n\nRecommendation: proceed, but negotiate the SLA clause before signing.\n\nBest, Rahul"
-    }
+  {
+    "id": 1,
+    "context": "Replying to a teammate asking for a deadline extension on a feature spec",
+    "incoming_subject": "Re: Q3 onboarding spec - more time?",
+    "reply": "Hi Priya,\n\nYeah, that's fine. Take until Thursday.\n\nIt's better to spend an extra day and get the details right than rush it. Just send it over once you're done and I'll review it the same day.\n\nThanks,\nRahil"
+  },
+  {
+    "id": 2,
+    "context": "Replying to a customer (via support) who reported a bug and is mildly frustrated",
+    "incoming_subject": "Re: Dashboard keeps timing out",
+    "reply": "Hi Marcus,\n\nThanks for reporting this. I can understand how frustrating it is when the dashboard times out.\n\nI've shared it with the engineering team and they're looking into the logs. I'll update you by tomorrow with what we find.\n\nFor now, you can use the 'Last 7 days' view as a workaround since it's lighter and should load normally.\n\nThanks,\nRahil"
+  },
+  {
+    "id": 3,
+    "context": "Replying to a cross-functional partner pushing back on a launch date",
+    "incoming_subject": "Re: Nov launch - is Nov 12 realistic?",
+    "reply": "Hi Sam,\n\nNov 12 is possible, but we'll need to lock the scope by the end of this week.\n\nIf the scope changes after that, I'd rather move the launch than rush something incomplete.\n\nI can also put together a quick summary of what's ready and what's still at risk so we can decide based on that. Let me know if that helps.\n\nThanks,\nRahil"
+  }
 ]
+
