@@ -22,8 +22,6 @@ import socket
 
 # ---------------------------------------------------------------------------
 # IPv4 monkey-patch (mirrors engine.py)
-# Prevents hangs on hosts that advertise IPv6 but can't complete the
-# connection — forces all DNS resolution to return IPv4 addresses only.
 # ---------------------------------------------------------------------------
 _original_getaddrinfo = socket.getaddrinfo
 
@@ -41,8 +39,51 @@ def ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 
 socket.getaddrinfo = ipv4_only_getaddrinfo
 
+import json
 import os
+from pathlib import Path
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# Streamlit Cloud credential bootstrap (shared logic with engine.py)
+# ---------------------------------------------------------------------------
+
+def _bootstrap_credentials_from_secrets() -> None:
+    """Write token.json / credentials.json from Streamlit secrets if absent."""
+    here = Path(__file__).resolve().parent
+
+    token_path = here / "token.json"
+    if not token_path.exists():
+        try:
+            import streamlit as st  # type: ignore
+            token_json = st.secrets.get("GOOGLE_TOKEN_JSON")
+            if token_json:
+                if isinstance(token_json, str):
+                    token_path.write_text(token_json, encoding="utf-8")
+                else:
+                    token_path.write_text(
+                        json.dumps(dict(token_json)), encoding="utf-8"
+                    )
+        except Exception:
+            pass
+
+    creds_path = here / "credentials.json"
+    if not creds_path.exists():
+        try:
+            import streamlit as st  # type: ignore
+            creds_json = st.secrets.get("GOOGLE_CREDENTIALS_JSON")
+            if creds_json:
+                if isinstance(creds_json, str):
+                    creds_path.write_text(creds_json, encoding="utf-8")
+                else:
+                    creds_path.write_text(
+                        json.dumps(dict(creds_json)), encoding="utf-8"
+                    )
+        except Exception:
+            pass
+
+
+_bootstrap_credentials_from_secrets()
 
 # ---------------------------------------------------------------------------
 # Config
@@ -61,92 +102,69 @@ _SCOPES = [
 # Calendar service builder
 # ---------------------------------------------------------------------------
 
+def _is_cloud_environment() -> bool:
+    """Return True when running on Streamlit Cloud (no interactive browser)."""
+    return (
+        os.environ.get("IS_STREAMLIT_CLOUD", "").lower() in ("1", "true")
+        or os.environ.get("STREAMLIT_SHARING_MODE", "") != ""
+        or os.environ.get("HOME", "") == "/home/appuser"
+    )
+
+
 def _build_calendar_service():
     """Return an authenticated Google Calendar v3 service resource.
 
-    Follows the same OAuth flow as ``engine._build_gmail_service()``:
-
-    1. Load an existing token from ``token.json`` if present.
-    2. Refresh it silently if expired and a refresh token is available.
-    3. Run the local OAuth flow (browser popup) if no valid token exists,
-       then persist the new token back to ``token.json``.
-    4. Build and return the Calendar v3 service.
-
-    The ``credentials.json`` and ``token.json`` files are resolved relative
-    to this file's directory — the same location engine.py uses — so both
-    modules share a single set of credential files.
-
-    Returns
-    -------
-    googleapiclient.discovery.Resource
-        Authenticated Calendar v3 service.
-
-    Raises
-    ------
-    FileNotFoundError
-        If ``credentials.json`` is missing and no valid ``token.json``
-        exists to skip the OAuth flow.
+    On Streamlit Cloud the token is bootstrapped from secrets at import
+    time; only a silent refresh is ever needed (no browser popup).
+    On local dev the full InstalledAppFlow runs as before.
     """
     from google.auth.transport.requests import Request  # type: ignore
     from google.oauth2.credentials import Credentials  # type: ignore
-    from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
     from googleapiclient.discovery import build  # type: ignore
 
     here = os.path.dirname(os.path.abspath(__file__))
     creds_path = os.path.join(here, "credentials.json")
     token_path = os.path.join(here, "token.json")
 
-    print(f"[DEBUG] credentials path = {creds_path}")
-    print(f"[DEBUG] token path       = {token_path}")
-
     creds: Credentials | None = None
 
     if os.path.exists(token_path):
-        print("[DEBUG] token.json exists")
         try:
             creds = Credentials.from_authorized_user_file(token_path, _SCOPES)
-            print("[DEBUG] loaded token.json")
         except ValueError as e:
             print(f"[DEBUG] token invalid: {e}")
             creds = None
 
     if not creds or not creds.valid:
-        print("[DEBUG] need authentication")
-
         if creds and creds.expired and creds.refresh_token:
-            print("[DEBUG] refreshing token")
             creds.refresh(Request())
-            print("[DEBUG] token refreshed")
-
+            with open(token_path, "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
         else:
-            print("[DEBUG] starting OAuth flow")
+            if _is_cloud_environment():
+                raise RuntimeError(
+                    "No valid Google token found on Streamlit Cloud.\n"
+                    "Add your token.json content as the GOOGLE_TOKEN_JSON "
+                    "secret in the Streamlit Cloud dashboard "
+                    "(Settings → Secrets)."
+                )
+
+            from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
 
             if not os.path.exists(creds_path):
                 raise FileNotFoundError(
                     f"Google OAuth client secrets not found at {creds_path}"
                 )
 
-            flow = InstalledAppFlow.from_client_secrets_file(
-                creds_path,
-                _SCOPES,
-            )
-
+            flow = InstalledAppFlow.from_client_secrets_file(creds_path, _SCOPES)
             creds = flow.run_local_server(
                 host="localhost",
                 port=8080,
                 open_browser=True,
             )
 
-            print("[DEBUG] OAuth completed")
-
-        print("[DEBUG] writing token.json")
-
-        with open(token_path, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
-
-        print("[DEBUG] token.json written")
-
-    print("[DEBUG] building Calendar service")
+            with open(token_path, "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
 
     service = build(
         "calendar",
@@ -154,8 +172,6 @@ def _build_calendar_service():
         credentials=creds,
         cache_discovery=False,
     )
-
-    print("[DEBUG] Calendar service built")
 
     return service
 

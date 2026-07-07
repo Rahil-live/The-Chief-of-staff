@@ -49,12 +49,69 @@ def ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 
 socket.getaddrinfo = ipv4_only_getaddrinfo
 
+import json
 import os
 from datetime import datetime, timezone
 from email.utils import getaddresses, parsedate_to_datetime
+from pathlib import Path
 from typing import Any
 
 from triage import triage_inbox, format_digest
+
+# ---------------------------------------------------------------------------
+# Streamlit Cloud credential bootstrap
+# ---------------------------------------------------------------------------
+# On Streamlit Cloud there is no local token.json / credentials.json.
+# Instead, we store the token as a Streamlit secret (GOOGLE_TOKEN_JSON)
+# and write it to disk at import time so the rest of the module can use
+# the standard file-based OAuth flow unchanged.
+
+def _bootstrap_credentials_from_secrets() -> None:
+    """Write token.json (and optionally credentials.json) from Streamlit
+    secrets if the files don't already exist on disk.
+
+    Safe to call on every import — it's a no-op when the files are
+    already present (local dev) or when Streamlit secrets aren't
+    configured.
+    """
+    here = Path(__file__).resolve().parent
+
+    # --- token.json from GOOGLE_TOKEN_JSON secret ---
+    token_path = here / "token.json"
+    if not token_path.exists():
+        try:
+            import streamlit as st  # type: ignore
+            token_json = st.secrets.get("GOOGLE_TOKEN_JSON")
+            if token_json:
+                # Secret may be stored as a string or as a TOML table.
+                if isinstance(token_json, str):
+                    token_path.write_text(token_json, encoding="utf-8")
+                else:
+                    # TOML table — serialise back to JSON string
+                    token_path.write_text(
+                        json.dumps(dict(token_json)), encoding="utf-8"
+                    )
+        except Exception:
+            pass  # Streamlit not available or secret not set — ignore
+
+    # --- credentials.json from GOOGLE_CREDENTIALS_JSON secret ---
+    creds_path = here / "credentials.json"
+    if not creds_path.exists():
+        try:
+            import streamlit as st  # type: ignore
+            creds_json = st.secrets.get("GOOGLE_CREDENTIALS_JSON")
+            if creds_json:
+                if isinstance(creds_json, str):
+                    creds_path.write_text(creds_json, encoding="utf-8")
+                else:
+                    creds_path.write_text(
+                        json.dumps(dict(creds_json)), encoding="utf-8"
+                    )
+        except Exception:
+            pass
+
+
+_bootstrap_credentials_from_secrets()
 
 # ---------------------------------------------------------------------------
 # Config
@@ -206,18 +263,38 @@ def materialize_threads(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
 # the same Google APIs the MCP server is built on, just without the MCP
 # transport layer.
 
-def _build_gmail_service():
+def _is_cloud_environment() -> bool:
+    """Return True when running on Streamlit Cloud (no interactive browser)."""
+    return (
+        os.environ.get("IS_STREAMLIT_CLOUD", "").lower() in ("1", "true")
+        or os.environ.get("STREAMLIT_SHARING_MODE", "") != ""
+        or os.environ.get("HOME", "") == "/home/appuser"
+    )
+
+
+def _build_gmail_service(creds=None):
+    """Build and return an authenticated Gmail API service.
+
+    Parameters
+    ----------
+    creds : google.oauth2.credentials.Credentials | None
+        If provided (from the per-user OAuth flow), use directly.
+        If None, fall back to reading token.json from disk (local dev).
+    """
     from google.auth.transport.requests import Request  # type: ignore
     from google.oauth2.credentials import Credentials  # type: ignore
-    from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
     from googleapiclient.discovery import build  # type: ignore
 
+    # --- Per-user credentials passed in from oauth_flow.py ---
+    if creds is not None:
+        if not creds.valid and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+    # --- Fallback: disk-based credentials (local dev) ---
     here = os.path.dirname(os.path.abspath(__file__))
     creds_path = os.path.join(here, "credentials.json")
     token_path = os.path.join(here, "token.json")
-
-    print(f"[DEBUG] credentials path = {creds_path}")
-    print(f"[DEBUG] token path       = {token_path}")
 
     scopes = [
         "https://www.googleapis.com/auth/gmail.readonly",
@@ -225,71 +302,41 @@ def _build_gmail_service():
         "https://www.googleapis.com/auth/calendar",
     ]
 
-    creds: Credentials | None = None
+    disk_creds: Credentials | None = None
 
     if os.path.exists(token_path):
-        print("[DEBUG] token.json exists")
         try:
-            creds = Credentials.from_authorized_user_file(token_path, scopes)
-            print("[DEBUG] loaded token.json")
+            disk_creds = Credentials.from_authorized_user_file(token_path, scopes)
         except ValueError as e:
             print(f"[DEBUG] token invalid: {e}")
-            creds = None
 
-    if not creds or not creds.valid:
-        print("[DEBUG] need authentication")
-
-        if creds and creds.expired and creds.refresh_token:
-            print("[DEBUG] refreshing token")
-            creds.refresh(Request())
-            print("[DEBUG] token refreshed")
-
+    if not disk_creds or not disk_creds.valid:
+        if disk_creds and disk_creds.expired and disk_creds.refresh_token:
+            disk_creds.refresh(Request())
+            with open(token_path, "w", encoding="utf-8") as f:
+                f.write(disk_creds.to_json())
         else:
-            print("[DEBUG] starting OAuth flow")
-
+            if _is_cloud_environment():
+                raise RuntimeError(
+                    "Not authenticated. Please sign in with Google first."
+                )
+            # Local dev: browser OAuth flow
+            from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
             if not os.path.exists(creds_path):
                 raise FileNotFoundError(
                     f"Gmail OAuth client secrets not found at {creds_path}"
                 )
+            flow = InstalledAppFlow.from_client_secrets_file(creds_path, scopes)
+            disk_creds = flow.run_local_server(host="localhost", port=8080, open_browser=True)
+            with open(token_path, "w", encoding="utf-8") as f:
+                f.write(disk_creds.to_json())
 
-            flow = InstalledAppFlow.from_client_secrets_file(
-                creds_path,
-                scopes,
-            )
+    return build("gmail", "v1", credentials=disk_creds, cache_discovery=False)
 
-            creds = flow.run_local_server(
-                host="localhost",
-                port=8080,
-                open_browser=True,
-            )
-
-            print("[DEBUG] OAuth completed")
-
-        print("[DEBUG] writing token.json")
-
-        with open(token_path, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
-
-        print("[DEBUG] token.json written")
-
-    print("[DEBUG] building Gmail service")
-
-    service = build(
-        "gmail",
-        "v1",
-        credentials=creds,
-        cache_discovery=False,
-    )
-
-    print("[DEBUG] Gmail service built")
-
-    return service
-
-def _fetch_threads_direct(max_results: int) -> list[dict[str, str]]:
+def _fetch_threads_direct(max_results: int, creds=None) -> list[dict[str, str]]:
     """Direct Gmail-API implementation of `fetch_threads`."""
-    service = _build_gmail_service()
+    service = _build_gmail_service(creds=creds)
 
-    # 1) Get the most recent inbox message IDs.
     list_resp = (
         service.users()
         .messages()
@@ -304,12 +351,8 @@ def _fetch_threads_direct(max_results: int) -> list[dict[str, str]]:
     if not message_refs:
         return []
 
-    # 2) Hydrate each message with full metadata + snippet.
-    #    We request format=metadata to keep payloads small; snippet is
-    #    still included in the response.
     normalized: list[dict[str, str]] = []
     for ref in message_refs:
-        print(ref["id"])
         msg = (
             service.users()
             .messages()
@@ -382,37 +425,9 @@ def _extract_body(payload: dict) -> str:
     return ""
 
 
-def fetch_full_thread(thread_id: str) -> dict:
-    """Fetch all messages in a Gmail thread with their complete bodies.
-
-    Unlike ``_fetch_threads_direct`` (which uses ``format=metadata`` for
-    speed), this fetches ``format=full`` so the complete MIME payload is
-    available. It is intended to be called on demand — e.g. just before
-    parsing meeting details — rather than for every inbox thread.
-
-    Parameters
-    ----------
-    thread_id : str
-        Gmail thread ID (the ``id`` field stored in ``session_state``).
-
-    Returns
-    -------
-    dict
-        A UI-shape thread dict::
-
-            {
-                "id":       str,
-                "subject":  str,
-                "messages": [
-                    {"from": str, "date": str, "body": str},
-                    ...
-                ]
-            }
-
-        The ``body`` field contains the full decoded plain-text content of
-        each message, not the 100-char snippet.
-    """
-    service = _build_gmail_service()
+def fetch_full_thread(thread_id: str, creds=None) -> dict:
+    """Fetch all messages in a Gmail thread with their complete bodies."""
+    service = _build_gmail_service(creds=creds)
 
     thread_resp = (
         service.users()
@@ -460,6 +475,7 @@ def send_reply(
     subject: str,
     body: str,
     message_id: str | None = None,
+    creds=None,
 ) -> dict[str, str]:
     """Send a reply to an existing Gmail thread.
 
@@ -511,7 +527,7 @@ def send_reply(
         "threadId": thread_id,
     }
 
-    service = _build_gmail_service()
+    service = _build_gmail_service(creds=creds)
     sent = (
         service.users()
         .messages()
@@ -534,55 +550,53 @@ def fetch_threads(
     max_results: int = DEFAULT_MAX_RESULTS,
     *,
     use_mcp: bool | None = None,
+    creds=None,
 ) -> list[dict[str, str]] | dict[str, Any]:
     """
     Fetch the most recent inbox threads from Gmail.
 
-    Returns either:
-      - a list of thread dicts (the common case), OR
-      - an MCP plan dict, if no Gmail credentials are available AND the
-        caller hasn't already gone through the MCP path. The plan tells
-        an MCP-aware host exactly which Gmail-MCP tools to invoke. Once
-        the host has executed the plan, it can pass the resulting
-        `read_email` payloads to `materialize_threads()` to get the
-        same list of dicts back.
-
     Parameters
     ----------
     max_results : int
-        How many inbox threads to return. Defaults to 20.
+        How many inbox threads to return. Defaults to 1.
     use_mcp : bool | None
         - True  : always emit an MCP plan, never hit Google directly.
         - False : always hit Google directly, fail if creds missing.
-        - None  : try direct path; fall back to MCP plan if creds are
-                  not configured.
+        - None  : try direct path; fall back to MCP plan if creds are not configured.
+    creds : google.oauth2.credentials.Credentials | None
+        Per-user OAuth credentials (from oauth_flow.py). If None, falls back to
+        reading token.json from disk (local dev).
+
+    Returns
+    -------
+    list[dict] | dict
+        Either a list of thread dicts or an MCP plan dict.
     """
     if use_mcp is True:
         return build_mcp_plan(max_results=max_results)
 
     if use_mcp is False:
-        return _fetch_threads_direct(max_results=max_results)
+        return _fetch_threads_direct(max_results=max_results, creds=creds)
 
-    # Auto mode: try direct first, fall back to MCP plan on credential
-    # errors so the function never explodes during a Cline run.
+    # Auto mode: try direct first
     here = os.path.dirname(os.path.abspath(__file__))
-    has_creds = os.path.exists(os.path.join(here, "credentials.json")) or os.path.exists(
-        os.path.join(here, "token.json")
+    has_creds = (
+        creds is not None
+        or os.path.exists(os.path.join(here, "credentials.json"))
+        or os.path.exists(os.path.join(here, "token.json"))
     )
     if not has_creds:
         return build_mcp_plan(max_results=max_results)
 
     try:
-        return _fetch_threads_direct(max_results=max_results)
+        return _fetch_threads_direct(max_results=max_results, creds=creds)
     except FileNotFoundError:
         return build_mcp_plan(max_results=max_results)
     except Exception:
         import traceback
-
         print("\n========== FULL TRACEBACK ==========\n")
         traceback.print_exc()
         print("\n====================================\n")
-
         raise
 
 

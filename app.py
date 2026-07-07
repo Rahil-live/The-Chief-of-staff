@@ -16,6 +16,27 @@ from typing import Any
 
 import streamlit as st
 from task_logger import log_action, get_action_log  # type: ignore
+from oauth_flow import render_auth_gate, get_credentials, get_user_info, logout, is_oauth_configured  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="The Draft Desk",
+    page_icon="✍️",
+    layout="wide",
+)
+
+# ---------------------------------------------------------------------------
+# Auth gate — must run before any other UI
+# ---------------------------------------------------------------------------
+# On local dev (no OAuth secrets configured) we skip the gate entirely.
+# On Streamlit Cloud with OAuth configured, user must sign in first.
+_oauth_enabled = is_oauth_configured()
+if _oauth_enabled:
+    if not render_auth_gate():
+        st.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -147,22 +168,20 @@ def _preview_from_body(body: str, limit: int = 200) -> str:
 
 def fetch_threads_via_engine() -> list[dict[str, Any]]:
     """
-    Call engine.fetch_threads() and convert the result into the UI thread
-    shape. If engine.py returns an MCP-plan dict instead of a thread list
-    (because creds aren't configured), raise RuntimeError with a friendly
-    message so the caller can surface it.
+    Call engine.fetch_threads() and convert the result into the UI thread shape.
+    Uses the per-user OAuth credentials from session state when available.
     """
-    fetch_threads = _get_fetch_threads()
-    result = fetch_threads()
+    from engine import fetch_threads  # type: ignore
+
+    # Get per-user credentials if OAuth is enabled
+    creds = get_credentials() if _oauth_enabled else None
+
+    result = fetch_threads(creds=creds)
 
     if not isinstance(result, list):
-        # engine.py returned an MCP plan — we can't run that from Streamlit.
         raise RuntimeError(
             "engine.fetch_threads() returned an MCP plan instead of thread "
-            "data. Gmail credentials (credentials.json / token.json) aren't "
-            "configured for direct use, and the MCP path must be driven by "
-            "an MCP-aware host. Run engine.py from a Cline session, or set "
-            "up Gmail OAuth credentials."
+            "data. Sign in with Google to grant Gmail access."
         )
 
     converted: list[dict[str, Any]] = []
@@ -173,9 +192,6 @@ def fetch_threads_via_engine() -> list[dict[str, Any]]:
         date = t.get("date", "")
         snippet = t.get("snippet", "")
 
-        # engine.py gives us one normalized message per Gmail thread; we
-        # wrap it as a single-message thread in our UI shape so the rest
-        # of the app is consistent.
         converted.append({
             "id": thread_id,
             "subject": subject,
@@ -560,6 +576,23 @@ def render_sidebar() -> None:
     with st.sidebar:
         st.title("✍️ The Draft Desk")
         st.caption("Chief of Staff — Draft workflow")
+
+        # User info if OAuth is enabled and user is logged in
+        if _oauth_enabled:
+            user = get_user_info()
+            if user:
+                st.divider()
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    if user.get("picture"):
+                        st.image(user["picture"], width=40)
+                with col2:
+                    st.caption(f"**{user.get('name', 'User')}**")
+                    st.caption(user.get("email", ""))
+                if st.button("🚪 Sign out", use_container_width=True):
+                    logout()
+                    st.rerun()
+
         st.divider()
 
         if st.button(
