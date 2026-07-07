@@ -20,7 +20,7 @@ from oauth_flow import render_auth_gate, get_credentials, get_user_info, logout,
 
 
 # ---------------------------------------------------------------------------
-# Page config
+# Page config — must be the FIRST Streamlit call
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="The Draft Desk",
@@ -29,25 +29,16 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Auth gate — must run before any other UI
+# Auth gate — runs before any other UI
 # ---------------------------------------------------------------------------
-# On local dev (no OAuth secrets configured) we skip the gate entirely.
-# On Streamlit Cloud with OAuth configured, user must sign in first.
+# When OAuth secrets (GOOGLE_CLIENT_ID etc.) are present in Streamlit secrets,
+# users must sign in before accessing the app.
+# On local dev (secrets not configured), the gate is skipped and the app
+# falls back to disk-based credentials (token.json).
 _oauth_enabled = is_oauth_configured()
 if _oauth_enabled:
     if not render_auth_gate():
         st.stop()
-
-
-# ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="The Draft Desk",
-    page_icon="✍️",
-    layout="wide",
-)
-
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -173,15 +164,23 @@ def fetch_threads_via_engine() -> list[dict[str, Any]]:
     """
     from engine import fetch_threads  # type: ignore
 
-    # Get per-user credentials if OAuth is enabled
+    # Get per-user credentials if OAuth is enabled and user is signed in
     creds = get_credentials() if _oauth_enabled else None
+
+    # If OAuth is configured but user has no credentials, something went wrong
+    if _oauth_enabled and creds is None:
+        raise RuntimeError(
+            "You are not signed in. Please sign in with Google first."
+        )
 
     result = fetch_threads(creds=creds)
 
     if not isinstance(result, list):
+        # This only happens on local dev without credentials.json / token.json
         raise RuntimeError(
-            "engine.fetch_threads() returned an MCP plan instead of thread "
-            "data. Sign in with Google to grant Gmail access."
+            "No Gmail credentials found. On Streamlit Cloud, add GOOGLE_CLIENT_ID, "
+            "GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI to Streamlit secrets. "
+            "Locally, ensure credentials.json and token.json are present."
         )
 
     converted: list[dict[str, Any]] = []
