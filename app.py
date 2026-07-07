@@ -16,7 +16,15 @@ from typing import Any
 
 import streamlit as st
 from task_logger import log_action, get_action_log  # type: ignore
-from oauth_flow import render_auth_gate, get_credentials, get_user_info, logout, is_oauth_configured  # type: ignore
+from oauth_flow import (  # type: ignore
+    get_credentials,
+    get_user_info,
+    logout,
+    is_oauth_configured,
+    is_authenticated,
+    build_auth_url,
+    exchange_code_for_token,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -29,16 +37,25 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Auth gate — runs before any other UI
+# Handle OAuth callback — runs on every load, before any other UI
+# If Google redirected back with ?code=..., exchange it for a token now,
+# then clear the URL and rerun cleanly. This never blocks the app.
 # ---------------------------------------------------------------------------
-# When OAuth secrets (GOOGLE_CLIENT_ID etc.) are present in Streamlit secrets,
-# users must sign in before accessing the app.
-# On local dev (secrets not configured), the gate is skipped and the app
-# falls back to disk-based credentials (token.json).
 _oauth_enabled = is_oauth_configured()
+
 if _oauth_enabled:
-    if not render_auth_gate():
-        st.stop()
+    _params = st.query_params
+    _code = _params.get("code")
+    _state = _params.get("state", "")
+    if _code:
+        with st.spinner("Completing Google sign-in…"):
+            _ok = exchange_code_for_token(_code, _state)
+        st.query_params.clear()
+        if _ok:
+            st.rerun()
+        else:
+            err = st.session_state.get("oauth_error", "Unknown error")
+            st.error(f"❌ Google sign-in failed: {err}")
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -159,27 +176,24 @@ def _preview_from_body(body: str, limit: int = 200) -> str:
 
 def fetch_threads_via_engine() -> list[dict[str, Any]]:
     """
-    Call engine.fetch_threads() and convert the result into the UI thread shape.
-    Uses the per-user OAuth credentials from session state when available.
+    Call engine.fetch_threads() using per-user OAuth credentials when available,
+    falling back to disk-based credentials on local dev.
     """
     from engine import fetch_threads  # type: ignore
 
-    # Get per-user credentials if OAuth is enabled and user is signed in
     creds = get_credentials() if _oauth_enabled else None
 
-    # If OAuth is configured but user has no credentials, something went wrong
     if _oauth_enabled and creds is None:
         raise RuntimeError(
-            "You are not signed in. Please sign in with Google first."
+            "Please sign in with Google first. "
+            "Click the **Sign in with Google** button in the sidebar."
         )
 
     result = fetch_threads(creds=creds)
 
     if not isinstance(result, list):
-        # This only happens on local dev without credentials.json / token.json
         raise RuntimeError(
-            "No Gmail credentials found. On Streamlit Cloud, add GOOGLE_CLIENT_ID, "
-            "GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI to Streamlit secrets. "
+            "No Gmail credentials found. On Streamlit Cloud, sign in with Google. "
             "Locally, ensure credentials.json and token.json are present."
         )
 
@@ -575,23 +589,6 @@ def render_sidebar() -> None:
     with st.sidebar:
         st.title("✍️ The Draft Desk")
         st.caption("Chief of Staff — Draft workflow")
-
-        # User info if OAuth is enabled and user is logged in
-        if _oauth_enabled:
-            user = get_user_info()
-            if user:
-                st.divider()
-                col1, col2 = st.columns([1, 3])
-                with col1:
-                    if user.get("picture"):
-                        st.image(user["picture"], width=40)
-                with col2:
-                    st.caption(f"**{user.get('name', 'User')}**")
-                    st.caption(user.get("email", ""))
-                if st.button("🚪 Sign out", use_container_width=True):
-                    logout()
-                    st.rerun()
-
         st.divider()
 
         if st.button(
@@ -614,8 +611,37 @@ def render_sidebar() -> None:
             key="source_radio",
         )
 
+        # Gmail source — show auth state and sign-in/out button
         if st.session_state.source == "Gmail via engine.py":
-            st.caption("Pulls live threads via engine.fetch_threads().")
+            if _oauth_enabled:
+                if is_authenticated():
+                    # Signed in — show user info and sign-out
+                    user = get_user_info()
+                    if user:
+                        st.caption(f"✅ Signed in as **{user.get('email', '')}**")
+                    if st.button("🚪 Sign out", use_container_width=True):
+                        logout()
+                        st.rerun()
+                else:
+                    # Not signed in — show sign-in button inline
+                    st.caption("Sign in with Google to fetch your Gmail inbox.")
+                    auth_url = build_auth_url()
+                    st.markdown(
+                        f"""<a href="{auth_url}" target="_self" style="text-decoration:none;">
+                        <div style="background:#fff;color:#3c4043;border:1px solid #dadce0;
+                        border-radius:4px;padding:8px 14px;font-size:14px;font-weight:500;
+                        display:flex;align-items:center;gap:10px;cursor:pointer;
+                        box-shadow:0 1px 3px rgba(0,0,0,.1);">
+                        <svg width="16" height="16" viewBox="0 0 18 18">
+                        <path fill="#4285F4" d="M16.51 8H8.98v3h4.3c-.18 1-.74 1.48-1.6 2.04v2.01h2.6a7.8 7.8 0 0 0 2.38-5.88c0-.57-.05-.66-.15-1.18z"/>
+                        <path fill="#34A853" d="M8.98 17c2.16 0 3.97-.72 5.3-1.94l-2.6-2a4.8 4.8 0 0 1-7.18-2.54H1.83v2.07A8 8 0 0 0 8.98 17z"/>
+                        <path fill="#FBBC05" d="M4.5 10.52a4.8 4.8 0 0 1 0-3.04V5.41H1.83a8 8 0 0 0 0 7.18l2.67-2.07z"/>
+                        <path fill="#EA4335" d="M8.98 4.18c1.17 0 2.23.4 3.06 1.2l2.3-2.3A8 8 0 0 0 1.83 5.4L4.5 7.49a4.77 4.77 0 0 1 4.48-3.3z"/>
+                        </svg>Sign in with Google</div></a>""",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.caption("Pulls live threads via engine.fetch_threads().")
 
         st.divider()
         st.subheader("Navigation")
